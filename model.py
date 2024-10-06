@@ -224,15 +224,26 @@ def get_best_available_device():
     else:
         return "cpu"
 
-def get_lr(epoch):
-    if epoch < 10:
-        return 3e-4
-    elif epoch < 15:
-        return 6e-5
-    elif epoch < 20:
-        return 3e-5
-    else:
-        return 1e-5
+
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(step):
+    """
+        Cosine learning rate schedule
+    """
+    if step < warmup_steps:
+        return max_lr * (step+1) / warmup_steps
+    if step > max_steps:
+        return min_lr
+    
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+    
 
 with open("datasets/shakespeare/input.txt", "r") as f:
     text = f.read()
@@ -255,32 +266,27 @@ print(f"Using device: {device}")
 
 enc = tiktoken.get_encoding("gpt2")
 
-num_epochs = 20
-num_steps = len(dataloader.tokens) // (B*T)
-
-for epoch in tqdm(range(num_epochs), desc="Training Epochs"):
-    lr = get_lr(epoch)
+for step in range(max_steps):
+    lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
-    for step in tqdm(range(num_steps), desc="Training Steps"):
-        x, y = dataloader.next_batch()
-        logits, loss = model(x, y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if step % 100 == 0:
-            print(f"Epoch {epoch}, Step {step}, Loss: {loss.item()}")
+    x, y = dataloader.next_batch()
+    logits, loss = model(x, y)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    print(f"Step {step} | lr: {lr} | Loss: {loss.item()}")
 
     # validation
-    model.eval()
-    val_loss = 0
-    val_steps = len(val_dataloader.tokens) // (B*T)
-    with torch.no_grad():
-        for _ in tqdm(range(val_steps), desc="Validation Steps"):
-            x, y = val_dataloader.next_batch()
-            logits, loss = model(x, y)
-            val_loss += loss.item()
-        print(f"Epoch {epoch}, Validation Loss: {val_loss/val_steps}")
+    # model.eval()
+    # val_loss = 0
+    # val_steps = len(val_dataloader.tokens) // (B*T)
+    # with torch.no_grad():
+    #     for _ in tqdm(range(val_steps), desc="Validation Steps"):
+    #         x, y = val_dataloader.next_batch()
+    #         logits, loss = model(x, y)
+    #         val_loss += loss.item()
+    #     print(f"Step {step} | lr: {lr} | Loss: {loss.item()}")
 
     model.train()
 
