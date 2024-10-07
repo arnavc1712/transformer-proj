@@ -242,7 +242,7 @@ class GPT(nn.Module):
         print(f"num non-decayed params: {len(no_decay_params)} with {num_no_decay_params:,} parameters")
 
         # use fused adam if possible
-        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters and device != "mps"
         print(f"Using {'fused' if fused_available else 'torch'} AdamW optimizer")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused_available)
         return optimizer
@@ -335,7 +335,10 @@ for step in range(max_steps):
     loss_accum = 0
     for micro_step in range(grad_accum_steps):
         x, y = dataloader.next_batch()
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        if torch.cuda.is_available():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+        else:
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
@@ -356,7 +359,8 @@ for step in range(max_steps):
         param_group["lr"] = lr
     
     optimizer.step()
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     t1 = time.time()
 
     dt = t1 - t0 # time diff in seconds
