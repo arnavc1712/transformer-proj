@@ -279,7 +279,14 @@ torch.set_float32_matmul_precision("high")
 device = get_best_available_device()
 torch.manual_seed(42)
 print(f"Using device: {device}")
-B, T = 8, 1024
+
+total_batch_size = 2**19 # ~0.5M tokens
+B = 8 # micro batch size
+T = 1024
+
+grad_accum_steps = total_batch_size // (B*T)
+print(f"Total desired batch size: {total_batch_size:,}")
+print(f"Gradient accumulation steps: {grad_accum_steps}")
 dataloader = DataLoaderLite(B, T, device=device, split="train")
 val_dataloader = DataLoaderLite(B, T, device=device, split="val")
 config = GPTConfig()
@@ -296,21 +303,30 @@ enc = tiktoken.get_encoding("gpt2")
 
 for step in range(max_steps):
     t0 = time.time()
+    optimizer.zero_grad()
+
+    loss_accum = 0
+    for micro_step in range(grad_accum_steps):
+        x, y = dataloader.next_batch()
+        logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
-    x, y = dataloader.next_batch()
-    logits, loss = model(x, y)
-    optimizer.zero_grad()
-    loss.backward()
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    
     optimizer.step()
     t1 = time.time()
 
     dt = t1 - t0 # time diff in seconds
-    token_per_sec = dataloader.B * dataloader.T / dt
+    total_tokens = dataloader.B * dataloader.T * grad_accum_steps
+    token_per_sec = total_tokens / dt
 
-    print(f"Step {step} | lr: {lr} | Loss: {loss.item()} | tokens/sec: {token_per_sec:,.0f} | norm: {norm} | time: {(dt*1000):.2f}ms")
+    print(f"Step {step} | lr: {lr} | Loss: {loss_accum.item()} | tokens/sec: {token_per_sec:,.0f} | norm: {norm} | time: {(dt*1000):.2f}ms")
 
     # validation
     # model.eval()
@@ -322,8 +338,6 @@ for step in range(max_steps):
     #         logits, loss = model(x, y)
     #         val_loss += loss.item()
     #     print(f"Step {step} | lr: {lr} | Loss: {loss.item()}")
-
-    model.train()
 
 # Save the model
 torch.save(model.state_dict(), "model.pth")
