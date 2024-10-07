@@ -1,12 +1,14 @@
-import tiktoken
+import os
 import math
+from dataclasses import dataclass
+import tiktoken
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
-import os
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
+import inspect
+import time
 
 class DataLoaderLite:
     def __init__(self, B, T, device="cpu", split="train"):
@@ -143,14 +145,14 @@ class GPT(nn.Module):
     
     def _init_weights(self, module):
         if isinstance(module, nn.Embedding):
-            print(module.weight.std(), module.weight.mean())
-        # if isinstance(module, nn.Linear) and hasattr(module, "RESIDUAL_SCALE_INIT"):
-        #     std = 0.02 * ((2.0 * config.n_layers) ** -0.5)
-        #     torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-        #     if module.bias is not None:
-        #         torch.nn.init.zeros_(module.bias)
-        # if isinstance(module, nn.Linear) and not hasattr(module, "RESIDUAL_SCALE_INIT"):
-        #     print(module.weight.std(), module.weight.mean())
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "RESIDUAL_SCALE_INIT"):
+                std *=  ((2.0 * config.n_layers) ** -0.5)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
     
     def forward(self, idx, targets=None):
         # x -> B, T
@@ -214,6 +216,31 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    def configure_optimizer(self, weight_decay: float, learning_rate: float, device):
+
+        param_dict = {k: v for k, v in self.named_parameters() if v.requires_grad}
+
+        # create the optimizer groups, we do not want to decay 1D weights and biases
+        decay_params = [v for k, v in param_dict.items() if v.dim() >= 2]
+        no_decay_params = [v for k, v in param_dict.items() if v.dim() < 2]
+
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0}
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_no_decay_params = sum(p.numel() for p in no_decay_params)
+        print(f"num decayed params: {len(decay_params)} with {num_decay_params:,} parameters")
+        print(f"num non-decayed params: {len(no_decay_params)} with {num_no_decay_params:,} parameters")
+
+        # use fused adam if possible
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        fused_available = False
+        print(f"Using {'fused' if fused_available else 'torch'} AdamW optimizer")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=fused_available)
+        return optimizer
 
 
 def get_best_available_device():
@@ -248,15 +275,16 @@ def get_lr(step):
 with open("datasets/shakespeare/input.txt", "r") as f:
     text = f.read()
 
+torch.set_float32_matmul_precision("high")
 device = get_best_available_device()
 torch.manual_seed(42)
 print(f"Using device: {device}")
-B, T = 64, 32
+B, T = 8, 1024
 dataloader = DataLoaderLite(B, T, device=device, split="train")
 val_dataloader = DataLoaderLite(B, T, device=device, split="val")
 config = GPTConfig()
 model = GPT(config)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
 model = model.to(device)
 
 
@@ -267,6 +295,7 @@ print(f"Using device: {device}")
 enc = tiktoken.get_encoding("gpt2")
 
 for step in range(max_steps):
+    t0 = time.time()
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
@@ -274,8 +303,14 @@ for step in range(max_steps):
     logits, loss = model(x, y)
     optimizer.zero_grad()
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    print(f"Step {step} | lr: {lr} | Loss: {loss.item()}")
+    t1 = time.time()
+
+    dt = t1 - t0 # time diff in seconds
+    token_per_sec = dataloader.B * dataloader.T / dt
+
+    print(f"Step {step} | lr: {lr} | Loss: {loss.item()} | tokens/sec: {token_per_sec:,.0f} | norm: {norm} | time: {(dt*1000):.2f}ms")
 
     # validation
     # model.eval()
