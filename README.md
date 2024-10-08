@@ -1,6 +1,6 @@
 # GPT-2 Pretraining Project
 
-This project implements a GPT-2 pretraining pipeline based on Andrej Karpathy's educational videos. It incorporates various advanced techniques to optimize training efficiency and performance.
+This project implements a GPT-2 pretraining pipeline based on Andrej Karpathy's educational videos and his nanoGPT repository. It incorporates various advanced techniques to optimize training efficiency and performance.
 
 ## Features
 
@@ -59,7 +59,12 @@ pip install -r requirements.txt
 
 ## Acknowledgements
 
-This project is inspired by and based on the educational content provided by Andrej Karpathy. It serves as an implementation of various advanced training techniques in the context of language model pretraining.
+This project is inspired by and based on the educational content provided by Andrej Karpathy, including:
+
+- His [YouTube videos](https://www.youtube.com/@AndrejKarpathy) on building GPT models from scratch
+- The [nanoGPT repository](https://github.com/karpathy/nanoGPT)
+
+This project serves as an implementation of various advanced training techniques in the context of language model pretraining, building upon these excellent resources.
 
 ## License
 
