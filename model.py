@@ -13,6 +13,12 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
+
+def load_tokens(filename):
+    tokens = np.fromfile(filename, dtype=np.uint16).astype(np.int32)
+    ptt = torch.tensor(tokens, dtype=torch.long)
+    return ptt
+
 class DataLoaderLite:
     def __init__(self, B, T, num_processes=1, process_rank=0, device="cpu", split="train"):
         """
@@ -24,27 +30,40 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.device = device
-        data_folder = "datasets/shakespeare"
-        if split == "train":
-            filename = os.path.join(data_folder, "train.bin")
-        else:
-            filename = os.path.join(data_folder, "val.bin")
+        assert split in {"train", "val"}, "split must be either train or val"
+        data_folder = "datasets/edu_fineweb10B/shards"
+        shards = os.listdir(data_folder)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_folder, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"No shards found for split: {split}"
+
+        if master_process:
+            print(f"Found {len(shards)} shards for split: {split}")
         
-        with open(filename, "r") as f:
-            data = np.fromfile(f, dtype=np.uint16).astype(np.int32)
-        self.tokens = torch.tensor(data).long()
+        # initialize the state to start with shard 0
+        self.current_shard = 0
+        self.tokens = load_tokens(shards[self.current_shard])
+        self.current_idx = self.B * self.T * self.process_rank # this is the current index in a specific shard
+    
+    def reset(self):
+        # reset the state to start from the beginning
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_idx = self.B * self.T * self.process_rank
     
     def next_batch(self):
         B, T, = self.B, self.T
         
         buf = self.tokens[self.current_idx: self.current_idx + (B*T) + 1]
-        x = buf[:-1].view(B, T)
-        y = buf[1:].view(B,T)
-
+        x = buf[:-1].view(B, T) # inputs
+        y = buf[1:].view(B,T) # targets
         
         self.current_idx += B*T*self.num_processes
         if self.current_idx + B*T*self.num_processes + 1 >= len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_idx = self.B * self.T * self.process_rank
         return x.to(self.device), y.to(self.device)
 
@@ -259,8 +278,8 @@ def get_best_available_device():
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715 # since the warmup is for 375M tokens
+max_steps = 19073 # since the batch size is 5M tokens, and total num of tokens is 10B
 
 def get_lr(step):
     """
@@ -314,8 +333,9 @@ if master_process:
     print(f"Total desired batch size: {total_batch_size:,}")
     print(f"Gradient accumulation steps per device: {grad_accum_steps}")
 
-dataloader = DataLoaderLite(B, T, num_processes=ddp_world_size, process_rank=ddp_rank, device=device, split="train")
+train_dataloader = DataLoaderLite(B, T, num_processes=ddp_world_size, process_rank=ddp_rank, device=device, split="train")
 val_dataloader = DataLoaderLite(B, T, num_processes=ddp_world_size, process_rank=ddp_rank, device=device, split="val")
+
 config = GPTConfig(vocab_size=50304)
 model = GPT(config)
 model = model.to(device)
@@ -329,6 +349,56 @@ optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, 
 enc = tiktoken.get_encoding("gpt2")
 
 for step in range(max_steps):
+    last_step = step == max_steps - 1
+    # run validation every 100 steps
+    if (step % 250 == 0) or last_step:
+        model.eval()
+        val_dataloader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_dataloader.next_batch()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+            if ddp:
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            if master_process:
+                print(f"Validation Loss: {val_loss_accum.item():.4f}")
+    
+    # once in a while we also want to sample
+    if (step > 0 and step % 250 == 0) or last_step:
+        model.eval()
+        num_returned_sequences = 4
+        max_length = 32
+        tokens = enc.encode_ordinary("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_returned_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        while xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad():
+                logits = model(xgen)
+                logits = logits[:, -1, :] # keep only the last token, B x vocab_size
+                probs = F.softmax(logits, dim=-1)
+
+                # we now do topk sampling to get the token
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
+                xcol = torch.gather(topk_indices, -1, ix)
+                xgen = torch.cat((xgen, xcol), dim=1)
+
+        # decode the tokens
+        for i in range(num_returned_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"Rank: {ddp_rank} | Sample {i+1}: {decoded}")
+
+    model.train()
     t0 = time.time()
     optimizer.zero_grad()
 
@@ -368,17 +438,6 @@ for step in range(max_steps):
     token_per_sec = total_tokens / dt
     if master_process:
         print(f"Step {step:4d} | lr: {lr:.4e} | Loss: {loss_accum.item():.6f} | tokens/sec: {token_per_sec:,.0f} | norm: {norm:.4f} | time: {(dt*1000):.2f}ms")
-
-    # validation
-    # model.eval()
-    # val_loss = 0
-    # val_steps = len(val_dataloader.tokens) // (B*T)
-    # with torch.no_grad():
-    #     for _ in tqdm(range(val_steps), desc="Validation Steps"):
-    #         x, y = val_dataloader.next_batch()
-    #         logits, loss = model(x, y)
-    #         val_loss += loss.item()
-    #     print(f"Step {step} | lr: {lr} | Loss: {loss.item()}")
 
 # destroy process groups when using ddp
 if ddp:
