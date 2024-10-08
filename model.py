@@ -323,7 +323,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 2**19 # ~0.5M tokens
-B = 16 # micro batch size
+B = 32 # micro batch size
 T = 1024
 
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
@@ -336,10 +336,12 @@ if master_process:
 train_dataloader = DataLoaderLite(B, T, num_processes=ddp_world_size, process_rank=ddp_rank, device=device, split="train")
 val_dataloader = DataLoaderLite(B, T, num_processes=ddp_world_size, process_rank=ddp_rank, device=device, split="val")
 
+use_compile = True
 config = GPTConfig(vocab_size=50304)
 model = GPT(config)
 model = model.to(device)
-model = torch.compile(model)
+if use_compile:
+    model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
@@ -369,7 +371,7 @@ for step in range(max_steps):
                 print(f"Validation Loss: {val_loss_accum.item():.4f}")
     
     # once in a while we also want to sample
-    if (step > 0 and step % 250 == 0) or last_step:
+    if ((step > 0 and step % 250 == 0) or last_step):
         model.eval()
         num_returned_sequences = 4
         max_length = 32
@@ -379,6 +381,13 @@ for step in range(max_steps):
         xgen = tokens.to(device)
         sample_rng = torch.Generator(device=device)
         sample_rng.manual_seed(42 + ddp_rank)
+
+        # Create a tqdm progress bar
+        pbar = tqdm(total=max_length - xgen.size(1), 
+                    desc=f"Sampling (Rank {ddp_rank})", 
+                    position=ddp_rank, 
+                    leave=False)
+
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
@@ -392,6 +401,10 @@ for step in range(max_steps):
                 xcol = torch.gather(topk_indices, -1, ix)
                 xgen = torch.cat((xgen, xcol), dim=1)
 
+            pbar.update(1)
+        
+        pbar.close()
+
         # decode the tokens
         for i in range(num_returned_sequences):
             tokens = xgen[i, :max_length].tolist()
@@ -404,7 +417,7 @@ for step in range(max_steps):
 
     loss_accum = 0
     for micro_step in range(grad_accum_steps):
-        x, y = dataloader.next_batch()
+        x, y = train_dataloader.next_batch()
         if torch.cuda.is_available():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits, loss = model(x, y)
@@ -434,7 +447,7 @@ for step in range(max_steps):
     t1 = time.time()
 
     dt = t1 - t0 # time diff in seconds
-    total_tokens = dataloader.B * dataloader.T * grad_accum_steps * ddp_world_size
+    total_tokens = train_dataloader.B * train_dataloader.T * grad_accum_steps * ddp_world_size
     token_per_sec = total_tokens / dt
     if master_process:
         print(f"Step {step:4d} | lr: {lr:.4e} | Loss: {loss_accum.item():.6f} | tokens/sec: {token_per_sec:,.0f} | norm: {norm:.4f} | time: {(dt*1000):.2f}ms")
