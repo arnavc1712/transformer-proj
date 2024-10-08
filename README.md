@@ -23,6 +23,16 @@ This project implements a GPT-2 pretraining pipeline based on Andrej Karpathy's 
 - **Device Agnostic**: Supports training on CUDA, MPS (Apple Silicon), and CPU.
 - **Customizable Configuration**: Easily adjustable hyperparameters through the `GPTConfig` class.
 
+## Dataset Preparation
+
+To download and prepare the dataset, run the following command:
+
+```bash
+python datasets/edu_fineweb10B/prepare.py
+```
+
+This script will download and process the necessary data for training.
+
 ## Usage
 
 To run the pretraining script:
@@ -38,6 +48,9 @@ torchrun --nproc_per_node=NUM_GPUS model.py
 Replace `NUM_GPUS` with the number of GPUs you want to use.
 
 ## Requirements
+
+Install the required dependencies using:
+
 ```bash
 pip install -r requirements.txt
 ```
