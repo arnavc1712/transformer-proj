@@ -47,6 +47,8 @@ torchrun --nproc_per_node=NUM_GPUS model.py
 
 Replace `NUM_GPUS` with the number of GPUs you want to use.
 
+**Hardware Note**: This code has been successfully run using `torchrun` on NVIDIA A100 GPUs. Performance may vary on different hardware configurations.
+
 ## Requirements
 
 Install the required dependencies using:
